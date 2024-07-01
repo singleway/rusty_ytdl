@@ -25,6 +25,7 @@ members = [".", "cli"]
 reqwest = { version = "0.12.4", features = [
     "cookies",
     "gzip",
+    "socks",
 ], default-features = false }
 scraper = "0.19.0"
 serde = "1.0.202"
