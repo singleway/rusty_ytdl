@@ -7,7 +7,7 @@ use crate::{block_async, VideoError};
 use serde::Serialize;
 
 #[derive(Clone, derive_more::Display, derivative::Derivative)]
-#[display(fmt = "YouTube()")]
+#[display("YouTube()")]
 #[derivative(Debug, PartialEq, Eq)]
 pub struct YouTube(AsyncYouTube);
 
@@ -98,6 +98,7 @@ impl Playlist {
     /// Get next chunk of videos from playlist and return fetched [`Video`] array.
     /// - If limit is [`None`] it will be [`u64::MAX`]
     /// - If [`Playlist`] is coming from [`SearchResult`] this function always return empty [`Vec<Video>`]!
+    ///
     /// to use this function with [`SearchResult`] follow example
     ///
     /// # Example
@@ -131,6 +132,7 @@ impl Playlist {
     /// Try to fetch all playlist videos and return [`Playlist`].
     /// - If limit is [`None`] it will be [`u64::MAX`]
     /// - If [`Playlist`] is coming from [`SearchResult`] this function always return [`Playlist`] with empty [`Vec<Video>`]!
+    ///
     /// to use this function with [`SearchResult`] follow example
     ///
     /// # Example

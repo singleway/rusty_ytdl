@@ -2,6 +2,7 @@ use boa_engine::{Context, Source};
 use once_cell::sync::Lazy;
 use rand::Rng;
 use regex::Regex;
+use scraper::{Html, Selector};
 use serde::{Deserialize, Serialize};
 use std::{
     borrow::Cow,
@@ -20,7 +21,7 @@ use crate::{
     info_extras::{get_author, get_chapters, get_dislikes, get_likes, get_storyboards},
     structs::{
         Embed, PlayerResponse, StreamingDataFormat, StringUtils, VideoDetails, VideoError,
-        VideoFormat, VideoOptions, VideoQuality, VideoSearchOptions,
+        VideoFormat, VideoOptions, VideoQuality, VideoSearchOptions, YTConfig,
     },
 };
 
@@ -30,14 +31,10 @@ pub fn get_html5player(body: &str) -> Option<String> {
         Regex::new(r#"<script\s+src="([^"]+)"(?:\s+type="text\\//javascript")?\s+name="player_ias\\//base"\s*>|"jsUrl":"([^"]+)""#).unwrap()
     });
 
-    let caps = HTML5PLAYER_RES.captures(body).unwrap();
-    match caps.get(2) {
-        Some(caps) => Some(caps.as_str().to_string()),
-        None => match caps.get(3) {
-            Some(caps) => Some(caps.as_str().to_string()),
-            None => Some(String::from("")),
-        },
-    }
+    let caps = HTML5PLAYER_RES.captures(body)?;
+    caps.get(2)
+        .or_else(|| caps.get(3))
+        .map(|cap| cap.as_str().to_string())
 }
 
 #[cfg_attr(feature = "performance_analysis", flamer::flame)]
@@ -458,16 +455,14 @@ fn decipher(
         Err(_) => return get_url_string(),
     };
 
-    let return_url = url::Url::parse(
-        args.get("url")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or(""),
-    );
-    if return_url.is_err() {
-        return get_url_string();
-    }
-
-    let mut return_url = return_url.unwrap();
+    let mut return_url = match args
+        .get("url")
+        .and_then(serde_json::Value::as_str)
+        .map_or_else(|| Err(url::ParseError::EmptyHost), url::Url::parse)
+    {
+        Ok(url) => url,
+        Err(_) => return get_url_string(),
+    };
     let query_name = args
         .get("sp")
         .and_then(serde_json::Value::as_str)
@@ -500,7 +495,7 @@ fn ncode(
     n_transfrom_cache: &mut HashMap<String, String>,
 ) -> String {
     let components: serde_json::value::Map<String, serde_json::Value> =
-        serde_qs::from_str(&decode(url).unwrap_or(Cow::Borrowed(url))).unwrap();
+        serde_qs::from_str(&decode(url).unwrap_or(Cow::Borrowed(url))).unwrap_or_default();
 
     let n_transform_value = match components.get("n").and_then(serde_json::Value::as_str) {
         Some(val) if !n_transform_script_string.1.is_empty() => val,
@@ -512,10 +507,10 @@ fn ncode(
     }
 
     #[cfg_attr(feature = "performance_analysis", flamer::flame)]
-    fn create_transform_script(script: &str) -> Context<'_> {
+    fn create_transform_script(script: &str) -> Option<Context> {
         let mut context = Context::default();
-        context.eval(Source::from_bytes(script)).unwrap();
-        context
+        context.eval(Source::from_bytes(script)).ok()?;
+        Some(context)
     }
 
     #[cfg_attr(feature = "performance_analysis", flamer::flame)]
@@ -534,15 +529,20 @@ fn ncode(
             .and_then(|result| {
                 result
                     .as_string()
-                    .map(|js_str| js_str.to_std_string().unwrap())
+                    .map(|js_str| js_str.to_std_string().unwrap_or_default())
             })
     }
 
-    let mut context = create_transform_script(n_transform_script_string.1);
+    let mut context = match create_transform_script(n_transform_script_string.1) {
+        Some(res) => res,
+        None => return url.to_string(),
+    };
 
-    let result =
-        execute_transform_script(&mut context, n_transform_script_string.0, n_transform_value);
-    let result = match result {
+    let result = match execute_transform_script(
+        &mut context,
+        n_transform_script_string.0,
+        n_transform_value,
+    ) {
         Some(res) => res,
         None => return url.to_string(),
     };
@@ -577,11 +577,11 @@ fn ncode(
 /// Excavate video id from URLs or id with Regex
 #[cfg_attr(feature = "performance_analysis", flamer::flame)]
 pub fn get_video_id(url: &str) -> Option<String> {
-    let url_regex = Regex::new(r"^https?://").unwrap();
+    static URL_REGEX: Lazy<Regex> = Lazy::new(|| Regex::new(r"^https?://").unwrap());
 
     if validate_id(url.to_string()) {
         Some(url.to_string())
-    } else if url_regex.is_match(url.trim()) {
+    } else if URL_REGEX.is_match(url.trim()) {
         get_url_video_id(url)
     } else {
         None
@@ -590,82 +590,72 @@ pub fn get_video_id(url: &str) -> Option<String> {
 
 #[cfg_attr(feature = "performance_analysis", flamer::flame)]
 pub fn validate_id(id: String) -> bool {
-    let id_regex = Regex::new(r"^[a-zA-Z0-9-_]{11}$").unwrap();
-
-    id_regex.is_match(id.trim())
+    static ID_REGEX: Lazy<Regex> = Lazy::new(|| Regex::new(r"^[a-zA-Z0-9-_]{11}$").unwrap());
+    ID_REGEX.is_match(id.trim())
 }
 
 #[cfg_attr(feature = "performance_analysis", flamer::flame)]
 fn get_url_video_id(url: &str) -> Option<String> {
-    // 1ms gain/req on Ryzen 9 5950XT (probably a lot more on slower CPUs)
     static VALID_PATH_DOMAINS: Lazy<Regex> = Lazy::new(|| {
         Regex::new(r"(?m)(?:^|\W)(?:youtube(?:-nocookie)?\.com/(?:.*[?&]v=|v/|shorts/|e(?:mbed)?/|[^/]+/.+/)|youtu\.be/)([\w-]+)")
         .unwrap()
     });
 
-    let parsed_result = url::Url::parse(url.trim());
+    let parsed = url::Url::parse(url.trim()).ok()?;
 
-    if parsed_result.is_err() {
-        return None;
-    }
-
-    let parsed = url::Url::parse(url.trim()).unwrap();
-
-    let mut id: Option<String> = None;
-
-    for value in parsed.query_pairs() {
-        if value.0.to_string().as_str() == "v" {
-            id = Some(value.1.to_string());
+    if let Some(id) = parsed.query_pairs().find_map(|(key, value)| {
+        if key == "v" {
+            Some(value.to_string())
+        } else {
+            None
         }
+    }) {
+        return Some(id).filter(|id| {
+            let return_id = id.substring(0, 11);
+            validate_id(return_id.into())
+        });
     }
 
-    if VALID_PATH_DOMAINS.is_match(url.trim()) && id.is_none() {
-        let captures = VALID_PATH_DOMAINS.captures(url.trim());
-        // println!("{:#?}", captures);
-        if let Some(captures_some) = captures {
-            let id_group = captures_some.get(1);
-            if let Some(id_group_some) = id_group {
-                id = Some(id_group_some.as_str().to_string());
+    if VALID_PATH_DOMAINS.is_match(url.trim()) {
+        if let Some(captures) = VALID_PATH_DOMAINS.captures(url.trim()) {
+            if let Some(id) = captures.get(1).map(|m| m.as_str().to_string()) {
+                return Some(id).filter(|id| {
+                    let return_id = id.substring(0, 11);
+                    validate_id(return_id.into())
+                });
             }
         }
-    } else if url::Url::parse(url.trim()).unwrap().host_str().is_some()
-        && !VALID_QUERY_DOMAINS
+    }
+
+    // Check if the host is valid
+    if parsed.host_str().is_some()
+        && VALID_QUERY_DOMAINS
             .iter()
             .any(|domain| domain == &parsed.host_str().unwrap_or(""))
     {
         return None;
     }
 
-    if let Some(id_some) = id {
-        id = Some(id_some.substring(0, 11).to_string());
-
-        if !validate_id(id.clone().unwrap()) {
-            return None;
-        }
-
-        id
-    } else {
-        None
-    }
+    None
 }
 
 #[cfg_attr(feature = "performance_analysis", flamer::flame)]
 pub fn get_text(obj: &serde_json::Value) -> &serde_json::Value {
-    let null_referance = &serde_json::Value::Null;
-    obj.as_object()
-        .and_then(|x| {
-            if x.contains_key("runs") {
-                x.get("runs").and_then(|c| {
-                    c.as_array()
-                        .unwrap()
-                        .first()
-                        .and_then(|d| d.as_object().and_then(|f| f.get("text")))
-                })
-            } else {
-                x.get("simpleText")
-            }
-        })
-        .unwrap_or(null_referance)
+    if !obj["runs"].is_null() {
+        &obj["runs"][0]["text"]
+    } else {
+        &obj["simpleText"]
+    }
+}
+
+#[cfg_attr(feature = "performance_analysis", flamer::flame)]
+pub fn is_live(player_response: &PlayerResponse) -> bool {
+    let video_details = player_response.video_details.as_ref();
+
+    video_details
+        .as_ref()
+        .and_then(|x| x.is_live_content)
+        .unwrap_or(false)
 }
 
 #[cfg_attr(feature = "performance_analysis", flamer::flame)]
@@ -824,10 +814,7 @@ pub fn clean_video_details(
             .as_ref()
             .and_then(|x| x.is_unplugged_corpus)
             .unwrap_or(false),
-        is_live_content: video_details
-            .as_ref()
-            .and_then(|x| x.is_live_content)
-            .unwrap_or(false),
+        is_live_content: is_live(player_response),
         thumbnails: [
             video_details
                 .as_ref()
@@ -863,29 +850,63 @@ pub fn is_verified(badges: &serde_json::Value) -> bool {
 
 #[cfg_attr(feature = "performance_analysis", flamer::flame)]
 pub fn is_age_restricted(media: &serde_json::Value) -> bool {
-    let mut age_restricted = false;
-    if media.is_object() && media.as_object().is_some() {
-        age_restricted = AGE_RESTRICTED_URLS.iter().any(|url| {
-            media
-                .as_object()
-                .map(|x| {
-                    let mut bool_vec: Vec<bool> = vec![];
-
-                    for (_key, value) in x {
-                        if let Some(value_some) = value.as_str() {
-                            bool_vec.push(value_some.contains(url))
-                        } else {
-                            bool_vec.push(false);
-                        }
-                    }
-
-                    bool_vec.iter().any(|v| v == &true)
-                })
-                .unwrap_or(false)
+    if let Some(media_object) = media.as_object() {
+        AGE_RESTRICTED_URLS.iter().any(|url| {
+            media_object
+                .values()
+                .any(|value| value.as_str().map_or(false, |v| v.contains(url)))
         })
+    } else {
+        false
+    }
+}
+
+#[cfg_attr(feature = "performance_analysis", flamer::flame)]
+pub fn is_age_restricted_from_html(player_response: &PlayerResponse, html: &str) -> bool {
+    if !player_response
+        .micro_format
+        .as_ref()
+        .and_then(|x| x.player_micro_format_renderer.clone())
+        .and_then(|x| x.is_family_safe)
+        .unwrap_or(true)
+    {
+        return true;
     }
 
-    age_restricted
+    let document = Html::parse_document(html);
+    let metas_selector = Selector::parse("meta").unwrap();
+
+    // <meta property="og:restrictions:age" content="18+">
+    let og_restrictions_age = document
+        .select(&metas_selector)
+        .filter(|x| {
+            x.attr("itemprop")
+                .or(x.attr("name"))
+                .or(x.attr("property"))
+                .or(x.attr("id"))
+                .or(x.attr("http-equiv"))
+                == Some("og:restrictions:age")
+        })
+        .map(|x| x.attr("content").unwrap_or("").to_string())
+        .next()
+        .unwrap_or(String::from(""));
+
+    // <meta itemprop="isFamilyFriendly" content="true">
+    let is_family_friendly = document
+        .select(&metas_selector)
+        .filter(|x| {
+            x.attr("itemprop")
+                .or(x.attr("name"))
+                .or(x.attr("property"))
+                .or(x.attr("id"))
+                .or(x.attr("http-equiv"))
+                == Some("isFamilyFriendly")
+        })
+        .map(|x| x.attr("content").unwrap_or("").to_string())
+        .next()
+        .unwrap_or(String::from(""));
+
+    is_family_friendly == "false" || og_restrictions_age == "18+"
 }
 
 #[cfg_attr(feature = "performance_analysis", flamer::flame)]
@@ -924,16 +945,34 @@ pub fn is_not_yet_broadcasted(player_response: &PlayerResponse) -> bool {
 
 #[cfg_attr(feature = "performance_analysis", flamer::flame)]
 pub fn is_play_error(player_response: &PlayerResponse, statuses: Vec<&str>) -> bool {
-    let playability = player_response
+    let playability_status = player_response
         .playability_status
         .as_ref()
         .and_then(|x| x.status.clone());
 
-    if let Some(playability_some) = playability {
+    if let Some(playability_some) = playability_status {
         return statuses.contains(&playability_some.as_str());
     }
 
     false
+}
+
+#[cfg_attr(feature = "performance_analysis", flamer::flame)]
+pub fn is_player_response_error(
+    player_response: &PlayerResponse,
+    reasons: &[&str],
+) -> Option<String> {
+    if let Some(reason) = player_response
+        .playability_status
+        .as_ref()
+        .and_then(|status| status.reason.as_deref())
+    {
+        if reasons.contains(&reason) {
+            return Some(reason.to_string());
+        }
+    }
+
+    None
 }
 
 #[cfg_attr(feature = "performance_analysis", flamer::flame)]
@@ -944,6 +983,17 @@ pub fn is_private_video(player_response: &PlayerResponse) -> bool {
         .and_then(|x| x.status.clone())
         .map(|x| x == "LOGIN_REQUIRED")
         .unwrap_or(false)
+}
+
+pub fn get_ytconfig(html: &str) -> Result<YTConfig, VideoError> {
+    static PATTERN: Lazy<Regex> = Lazy::new(|| Regex::new(r#"ytcfg\.set\((\{.*\})\);"#).unwrap());
+    match PATTERN.captures(html) {
+        Some(c) => Ok(
+            serde_json::from_str::<YTConfig>(c.get(1).map_or("", |m| m.as_str()))
+                .map_err(|_x| VideoError::VideoSourceNotFound)?,
+        ),
+        None => Err(VideoError::VideoSourceNotFound),
+    }
 }
 
 type CacheFunctions = Lazy<RwLock<Option<(String, Vec<(String, String)>)>>>;
@@ -959,6 +1009,8 @@ pub async fn get_functions(
     url.query_pairs_mut().clear();
 
     let url = url.as_str();
+
+    // println!("html5player url: {}", url);
 
     {
         // Check if an URL is already cached
@@ -994,13 +1046,12 @@ pub fn extract_functions(body: String) -> Vec<(String, String)> {
         }
 
         let function_start = format!(r#"var {function_name}={{"#);
-        let ndx = body.find(function_start.as_str());
+        let ndx = match body.find(function_start.as_str()) {
+            Some(i) => i,
+            None => return String::new(),
+        };
 
-        if ndx.is_none() {
-            return String::new();
-        }
-
-        let sub_body = body.slice((ndx.unwrap() + function_start.len() - 1)..);
+        let sub_body = body.slice((ndx + function_start.len() - 1)..);
 
         let cut_after_sub_body = cut_after_js(sub_body).unwrap_or("null");
 
@@ -1026,14 +1077,12 @@ pub fn extract_functions(body: String) -> Vec<(String, String)> {
 
                 function_body = format!(
                     "{manipulated_body};{function_body};",
-                    manipulated_body = extract_manipulations(
-                        body.clone(),
-                        function_body.as_str(),
-                        // cut_after_js_script
-                    ),
+                    manipulated_body = extract_manipulations(body.clone(), function_body.as_str(),),
                 );
 
                 function_body.retain(|c| c != '\n');
+
+                // println!("decipher function: {}", function_body);
 
                 functions.push((function_name.to_string(), function_body));
             }
@@ -1042,7 +1091,7 @@ pub fn extract_functions(body: String) -> Vec<(String, String)> {
 
     #[cfg_attr(feature = "performance_analysis", flamer::flame)]
     fn extract_ncode(body: String, functions: &mut Vec<(String, String)>) {
-        let mut function_name = between(body.as_str(), r#"&&(b=a.get("n"))&&(b="#, "(b)");
+        let mut function_name = between(body.as_str(), r#"c=a.get(b))&&(c="#, "(c)");
 
         let left_name = format!(
             "var {splitted_function_name}=[",
@@ -1055,6 +1104,28 @@ pub fn extract_functions(body: String) -> Vec<(String, String)> {
 
         if function_name.contains('[') {
             function_name = between(body.as_str(), left_name.as_str(), "]");
+        }
+
+        if function_name.is_empty() {
+            static FUNCTION_REGEX: Lazy<Regex> = Lazy::new(|| {
+                Regex::new(
+                    r"(?xs);\s*(?P<name>[a-zA-Z0-9_$]+)\s*=\s*function\([a-zA-Z0-9_$]+\)\s*\{",
+                )
+                .unwrap()
+            });
+
+            for caps in FUNCTION_REGEX.captures_iter(body.as_str()) {
+                let name = caps.name("name").unwrap().as_str();
+
+                let start_pos = caps.get(0).unwrap().end();
+                if let Some(end_pos) = body[start_pos..].find("};") {
+                    let function_body = &body[start_pos..start_pos + end_pos];
+
+                    if function_body.contains("enhanced_except_") {
+                        function_name = name;
+                    }
+                }
+            }
         }
 
         // println!("ncode function name: {}", function_name);
@@ -1072,6 +1143,8 @@ pub fn extract_functions(body: String) -> Vec<(String, String)> {
 
                 function_body.retain(|c| c != '\n');
 
+                // println!("ncode function: {}", function_body);
+
                 functions.push((function_name.to_string(), function_body));
             }
         }
@@ -1080,7 +1153,6 @@ pub fn extract_functions(body: String) -> Vec<(String, String)> {
     extract_decipher(body.clone(), &mut functions);
     extract_ncode(body, &mut functions);
 
-    // println!("{:#?} {}", functions, functions.len());
     functions
 }
 
@@ -1098,19 +1170,15 @@ pub async fn get_html(
         client.get(url)
     }
     .send()
-    .await;
+    .await
+    .map_err(VideoError::ReqwestMiddleware)?;
 
-    if request.is_err() {
-        return Err(VideoError::ReqwestMiddleware(request.err().unwrap()));
-    }
+    let response_first = request
+        .text()
+        .await
+        .map_err(|_x| VideoError::BodyCannotParsed)?;
 
-    let response_first = request.unwrap().text().await;
-
-    if response_first.is_err() {
-        return Err(VideoError::BodyCannotParsed);
-    }
-
-    Ok(response_first.unwrap())
+    Ok(response_first)
 }
 
 /// Try to generate IPv6 with custom valid block
@@ -1127,22 +1195,12 @@ pub fn get_random_v6_ip(ip: impl Into<String>) -> Result<IpAddr, VideoError> {
     }
 
     let format_attr = ipv6_format.split('/').collect::<Vec<&str>>();
-    let raw_addr = format_attr.first();
-    let raw_mask = format_attr.get(1);
+    let raw_addr = format_attr.first().ok_or(VideoError::InvalidIPv6Format)?;
+    let raw_mask = format_attr.get(1).ok_or(VideoError::InvalidIPv6Format)?;
 
-    if raw_addr.is_none() || raw_mask.is_none() {
-        return Err(VideoError::InvalidIPv6Format);
-    }
-
-    let raw_addr = raw_addr.unwrap();
-    let raw_mask = raw_mask.unwrap();
-
-    let base_10_mask = raw_mask.parse::<u8>();
-    if base_10_mask.is_err() {
-        return Err(VideoError::InvalidIPv6Subnet);
-    }
-
-    let mut base_10_mask = base_10_mask.unwrap();
+    let mut base_10_mask = raw_mask
+        .parse::<u8>()
+        .map_err(|_x| VideoError::InvalidIPv6Subnet)?;
 
     if !(24..=128).contains(&base_10_mask) {
         return Err(VideoError::InvalidIPv6Subnet);
@@ -1221,9 +1279,9 @@ pub fn time_to_ms(duration: &str) -> usize {
 #[cfg_attr(feature = "performance_analysis", flamer::flame)]
 pub fn parse_abbreviated_number(time_str: &str) -> usize {
     let replaced_string = time_str.replace(',', ".").replace(' ', "");
-    let string_match_regex: Lazy<Regex> = Lazy::new(|| Regex::new(r"([\d,.]+)([MK]?)").unwrap());
+    static STRING_MATCH_REGEX: Lazy<Regex> = Lazy::new(|| Regex::new(r"([\d,.]+)([MK]?)").unwrap());
 
-    if let Some(caps) = string_match_regex.captures(replaced_string.as_str()) {
+    if let Some(caps) = STRING_MATCH_REGEX.captures(replaced_string.as_str()) {
         let return_value = if caps.len() > 0 {
             let mut num;
 

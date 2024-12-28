@@ -8,9 +8,9 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio::sync::RwLock;
 
-use crate::constants::DEFAULT_HEADERS;
+use crate::constants::{DEFAULT_HEADERS, DEFAULT_MAX_RETRIES};
 use crate::stream::streams::Stream;
-use crate::structs::VideoError;
+use crate::structs::{CustomRetryableStrategy, VideoError};
 
 #[cfg(feature = "ffmpeg")]
 use crate::structs::FFmpegArgs;
@@ -59,14 +59,17 @@ impl NonLiveStream {
 
             let retry_policy = reqwest_retry::policies::ExponentialBackoff::builder()
                 .retry_bounds(
-                    std::time::Duration::from_millis(500),
-                    std::time::Duration::from_millis(10000),
+                    std::time::Duration::from_millis(1000),
+                    std::time::Duration::from_millis(30000),
                 )
-                .build_with_max_retries(3);
+                .build_with_max_retries(DEFAULT_MAX_RETRIES);
             reqwest_middleware::ClientBuilder::new(client)
-                .with(reqwest_retry::RetryTransientMiddleware::new_with_policy(
-                    retry_policy,
-                ))
+                .with(
+                    reqwest_retry::RetryTransientMiddleware::new_with_policy_and_strategy(
+                        retry_policy,
+                        CustomRetryableStrategy,
+                    ),
+                )
                 .build()
         };
 
@@ -208,7 +211,9 @@ impl Stream for NonLiveStream {
             .headers(headers)
             .send()
             .await
-            .map_err(VideoError::ReqwestMiddleware)?;
+            .map_err(VideoError::ReqwestMiddleware)?
+            .error_for_status()
+            .map_err(VideoError::Reqwest)?;
 
         let mut buf: BytesMut = BytesMut::new();
 

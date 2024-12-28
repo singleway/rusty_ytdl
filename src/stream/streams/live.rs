@@ -1,10 +1,9 @@
-use crate::constants::DEFAULT_HEADERS;
-use crate::stream::encryption::Encryption;
-use crate::stream::media_format::MediaFormat;
-use crate::stream::remote_data::RemoteData;
-use crate::stream::segment::Segment;
-use crate::stream::streams::Stream;
-use crate::structs::VideoError;
+use crate::constants::{DEFAULT_HEADERS, DEFAULT_MAX_RETRIES};
+use crate::stream::{
+    encryption::Encryption, media_format::MediaFormat, remote_data::RemoteData, segment::Segment,
+    streams::Stream,
+};
+use crate::structs::{CustomRetryableStrategy, VideoError};
 use crate::utils::{get_html, make_absolute_url};
 
 use async_trait::async_trait;
@@ -39,14 +38,17 @@ impl LiveStream {
 
             let retry_policy = reqwest_retry::policies::ExponentialBackoff::builder()
                 .retry_bounds(
-                    std::time::Duration::from_millis(500),
-                    std::time::Duration::from_millis(10000),
+                    std::time::Duration::from_millis(1000),
+                    std::time::Duration::from_millis(30000),
                 )
-                .build_with_max_retries(3);
+                .build_with_max_retries(DEFAULT_MAX_RETRIES);
             reqwest_middleware::ClientBuilder::new(client)
-                .with(reqwest_retry::RetryTransientMiddleware::new_with_policy(
-                    retry_policy,
-                ))
+                .with(
+                    reqwest_retry::RetryTransientMiddleware::new_with_policy_and_strategy(
+                        retry_policy,
+                        CustomRetryableStrategy,
+                    ),
+                )
                 .build()
         };
 
@@ -217,18 +219,15 @@ impl Stream for LiveStream {
 
         let headers = DEFAULT_HEADERS.clone();
 
-        let response = self
+        let mut response = self
             .client
             .get(first_segment.0.url().as_str())
             .headers(headers)
             .send()
-            .await;
-
-        if response.is_err() {
-            return Err(VideoError::ReqwestMiddleware(response.err().unwrap()));
-        }
-
-        let mut response = response.expect("IMPOSSIBLE");
+            .await
+            .map_err(VideoError::ReqwestMiddleware)?
+            .error_for_status()
+            .map_err(VideoError::Reqwest)?;
 
         let mut buf: BytesMut = BytesMut::new();
 

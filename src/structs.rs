@@ -4,6 +4,7 @@ use serde::{
     Deserialize, Deserializer, Serialize, Serializer,
 };
 use std::{
+    borrow::Cow,
     cmp::Ordering,
     fmt::{Debug, Formatter, Result as fmtResult},
     ops::{Bound, RangeBounds},
@@ -27,16 +28,16 @@ pub struct VideoInfo {
 #[derive(Clone, derive_more::Display)]
 pub enum VideoSearchOptions {
     /// Video & Audio
-    #[display(fmt = "Video & Audio")]
+    #[display("Video & Audio")]
     VideoAudio,
     /// Only Video
-    #[display(fmt = "Video")]
+    #[display("Video")]
     Video,
     /// Only Audio
-    #[display(fmt = "Audio")]
+    #[display("Audio")]
     Audio,
     /// Custom filter
-    #[display(fmt = "Custom")]
+    #[display("Custom")]
     Custom(Arc<dyn Fn(&VideoFormat) -> bool + Sync + Send + 'static>),
 }
 
@@ -72,25 +73,25 @@ type CustomVideoQualityComparator =
 #[derive(Clone, derive_more::Display)]
 pub enum VideoQuality {
     /// Highest Video & Audio
-    #[display(fmt = "Highest")]
+    #[display("Highest")]
     Highest,
     /// Lowest Video & Audio
-    #[display(fmt = "Lowest")]
+    #[display("Lowest")]
     Lowest,
     /// Only Highest Audio
-    #[display(fmt = "Highest Audio")]
+    #[display("Highest Audio")]
     HighestAudio,
     /// Only Lowest Audio
-    #[display(fmt = "Lowest Audio")]
+    #[display("Lowest Audio")]
     LowestAudio,
     /// Only Highest Video
-    #[display(fmt = "Highest Video")]
+    #[display("Highest Video")]
     HighestVideo,
     /// Only Lowest Video
-    #[display(fmt = "Lowest Video")]
+    #[display("Lowest Video")]
     LowestVideo,
     /// Custom ranking function and filter
-    #[display(fmt = "Custom")]
+    #[display("Custom")]
     Custom(VideoSearchOptions, CustomVideoQualityComparator),
 }
 
@@ -128,7 +129,7 @@ impl PartialEq for VideoQuality {
 
 /// Video search and download options
 #[derive(Clone, derive_more::Display, derivative::Derivative)]
-#[display(fmt = "VideoOptions(quality: {quality}, filter: {filter})")]
+#[display("VideoOptions(quality: {quality}, filter: {filter})")]
 #[derivative(Debug, PartialEq, Eq)]
 pub struct VideoOptions {
     pub quality: VideoQuality,
@@ -149,16 +150,30 @@ impl Default for VideoOptions {
     }
 }
 
+impl<'opts> From<&'opts VideoOptions> for Cow<'opts, VideoOptions> {
+    fn from(value: &'opts VideoOptions) -> Self {
+        Cow::Borrowed(value)
+    }
+}
+
+impl From<VideoOptions> for Cow<'static, VideoOptions> {
+    fn from(value: VideoOptions) -> Self {
+        Cow::Owned(value)
+    }
+}
+
 /// Video download options
 #[derive(Clone, PartialEq, Debug, Default, derive_more::Display)]
-#[display(fmt = "DownloadOptions()")]
+#[display("DownloadOptions(download chunk size: {dl_chunk_size:?})")]
 pub struct DownloadOptions {
     /// Maximum chunk size on per request
     pub dl_chunk_size: Option<u64>,
 }
 
 #[derive(Clone, Debug, Default, derive_more::Display)]
-#[display(fmt = "RequestOptions()")]
+#[display(
+    "RequestOptions(cookies: {cookies:?}, IPv6: {ipv6_block:?}, max retries: {max_retries:?})"
+)]
 pub struct RequestOptions {
     /// [`reqwest::Client`] to on use request. If provided in the request options `proxy`, `cookies`, and `ipv6_block` will be ignored
     ///
@@ -218,6 +233,24 @@ pub struct RequestOptions {
     ///     };
     /// ```
     pub ipv6_block: Option<String>,
+    /// Number of retries to allow per web request (ie, per chunk downloaded)
+    /// Default is [`crate::constants::DEFAULT_MAX_RETRIES`].
+    ///
+    /// # Example
+    /// ```ignore
+    ///     // Allow 5 retries per chunk.
+    ///     let video_options = VideoOptions {
+    ///          request_options: RequestOptions {
+    ///               max_retries: Some(5),
+    ///                ..Default::default()
+    ///          },
+    ///          ..Default::default()
+    ///     };
+    /// ```
+    pub max_retries: Option<u32>,
+    /// Supply a YouTube Proof of Origin token. Use at your own risk.
+    /// See https://github.com/yt-dlp/yt-dlp/wiki/Extractors#po-token-guide for more information.
+    pub po_token: Option<String>,
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -231,6 +264,9 @@ pub enum VideoError {
     /// Video is private
     #[error("Video is private")]
     VideoIsPrivate,
+    /// Video player response errors
+    #[error("Player Response Error: {0}")]
+    VideoPlayerResponseError(String),
     /// Reqwest error
     #[error(transparent)]
     Reqwest(#[from] reqwest::Error),
@@ -494,7 +530,7 @@ pub struct Author {
     pub thumbnails: Vec<Thumbnail>,
     pub verified: bool,
     #[serde(rename = "subscriberCount")]
-    pub subscriber_count: i32,
+    pub subscriber_count: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -776,7 +812,7 @@ impl FFmpegArgs {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
 pub struct PlayerResponse {
     #[serde(rename = "streamingData")]
     pub streaming_data: Option<StreamingData>,
@@ -978,6 +1014,7 @@ pub struct StreamingDataFormatColorInfo {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PlayabilityStatus {
     pub status: Option<String>,
+    pub reason: Option<String>,
     #[serde(rename = "errorScreen")]
     pub error_screen: Option<ErrorScreen>,
 }
@@ -986,4 +1023,45 @@ pub struct PlayabilityStatus {
 pub struct ErrorScreen {
     #[serde(rename = "playerLegacyDesktopYpcOfferRenderer")]
     pub player_legacy_desktop_ypc_offer_renderer: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct YTConfig {
+    #[serde(rename = "STS")]
+    pub sts: Option<u64>,
+    #[serde(rename = "WEB_PLAYER_CONTEXT_CONFIGS")]
+    pub web_player_context_configs: Option<serde_json::Value>,
+}
+
+pub struct CustomRetryableStrategy;
+
+impl reqwest_retry::RetryableStrategy for CustomRetryableStrategy {
+    fn handle(
+        &self,
+        res: &reqwest_middleware::Result<reqwest::Response>,
+    ) -> Option<reqwest_retry::Retryable> {
+        match res {
+            // retry if 201
+            Ok(success) => custom_on_request_success(success),
+            Err(error) => reqwest_retry::default_on_request_failure(error),
+        }
+    }
+}
+
+/// Custom request success retry strategy.
+///
+/// Will only retry if:
+/// * The status was 5XX (server error)
+/// * The status was 4XX (client error)
+///
+/// Note that success here means that the request finished without interruption, not that it was logically OK.
+fn custom_on_request_success(success: &reqwest::Response) -> Option<reqwest_retry::Retryable> {
+    let status = success.status();
+    if status.is_server_error() || status.is_client_error() {
+        Some(reqwest_retry::Retryable::Transient)
+    } else if status.is_success() {
+        None
+    } else {
+        Some(reqwest_retry::Retryable::Fatal)
+    }
 }

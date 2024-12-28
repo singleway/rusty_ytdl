@@ -1,11 +1,13 @@
+use once_cell::sync::Lazy;
 use reqwest::{
-    header::{HeaderMap, HeaderValue, COOKIE},
+    header::{HeaderMap, HeaderName, HeaderValue, COOKIE},
     Client,
 };
 use reqwest_middleware::{ClientBuilder, ClientWithMiddleware};
 use reqwest_retry::{policies::ExponentialBackoff, RetryTransientMiddleware};
 use scraper::{Html, Selector};
-use std::{path::Path, time::Duration};
+use serde_json::json;
+use std::{borrow::{Borrow, Cow}, path::Path, time::Duration};
 use url::Url;
 
 #[cfg(feature = "live")]
@@ -14,31 +16,32 @@ use crate::stream::{LiveStream, LiveStreamOptions};
 use crate::structs::FFmpegArgs;
 
 use crate::{
-    constants::BASE_URL,
+    constants::{BASE_URL, DEFAULT_DL_CHUNK_SIZE, DEFAULT_MAX_RETRIES, INNERTUBE_CLIENT},
     info_extras::{get_media, get_related_videos},
     stream::{NonLiveStream, NonLiveStreamOptions, Stream},
-    structs::{PlayerResponse, VideoError, VideoInfo, VideoOptions},
+    structs::{
+        CustomRetryableStrategy, PlayerResponse, VideoError, VideoInfo, VideoOptions, YTConfig,
+    },
     utils::{
-        between, choose_format, clean_video_details, get_functions, get_html, get_html5player,
-        get_random_v6_ip, get_video_id, is_not_yet_broadcasted, is_play_error, is_private_video,
+        between, choose_format, clean_video_details, get_functions, get_html,
+        get_html5player, get_random_v6_ip, get_video_id, get_ytconfig, is_age_restricted_from_html,
+        is_live, is_not_yet_broadcasted, is_play_error, is_player_response_error, is_private_video,
         is_rental, parse_live_video_formats, parse_video_formats, sort_formats,
     },
 };
 
-// 10485760 -> Default is 10MB to avoid Youtube throttle (Bigger than this value can be throttle by Youtube)
-pub(crate) const DEFAULT_DL_CHUNK_SIZE: u64 = 10485760;
-
 #[derive(Clone, derive_more::Display, derivative::Derivative)]
-#[display(fmt = "Video({video_id})")]
+#[display("Video({video_id})")]
 #[derivative(Debug, PartialEq, Eq)]
-pub struct Video {
+/// If a video was created with a reference to options, it is tied to their lifetime `'opts`.
+pub struct Video<'opts> {
     video_id: String,
-    options: VideoOptions,
+    options: Cow<'opts, VideoOptions>,
     #[derivative(PartialEq = "ignore")]
     client: ClientWithMiddleware,
 }
 
-impl Video {
+impl Video<'static> {
     /// Crate [`Video`] struct to get info or download with default [`VideoOptions`]
     #[cfg_attr(feature = "performance_analysis", flamer::flame)]
     pub fn new(url_or_id: impl Into<String>) -> Result<Self, VideoError> {
@@ -47,24 +50,32 @@ impl Video {
         let client = Client::builder().build().map_err(VideoError::Reqwest)?;
 
         let retry_policy = ExponentialBackoff::builder()
-            .retry_bounds(Duration::from_millis(500), Duration::from_millis(10000))
-            .build_with_max_retries(3);
+            .retry_bounds(Duration::from_millis(1000), Duration::from_millis(30000))
+            .build_with_max_retries(DEFAULT_MAX_RETRIES);
         let client = ClientBuilder::new(client)
-            .with(RetryTransientMiddleware::new_with_policy(retry_policy))
+            .with(RetryTransientMiddleware::new_with_policy_and_strategy(
+                retry_policy,
+                CustomRetryableStrategy,
+            ))
             .build();
 
         Ok(Self {
             video_id,
-            options: VideoOptions::default(),
+            options: Cow::Owned(VideoOptions::default()),
             client,
         })
     }
+}
 
+impl<'opts> Video<'opts> {
     /// Crate [`Video`] struct to get info or download with custom [`VideoOptions`]
+    /// `VideoOptions` can be passed by value or by reference, if passed by
+    /// reference, returned `Video` will be tied to the lifetime of the `VideoOptions`.
     pub fn new_with_options(
         url_or_id: impl Into<String>,
-        options: VideoOptions,
+        options: impl Into<Cow<'opts, VideoOptions>>,
     ) -> Result<Self, VideoError> {
+        let options = options.into();
         let video_id = get_video_id(&url_or_id.into()).ok_or(VideoError::VideoNotFound)?;
 
         let client = match options.request_options.client.clone() {
@@ -95,11 +106,19 @@ impl Video {
             }
         };
 
+        let max_retries = options
+            .request_options
+            .max_retries
+            .unwrap_or(DEFAULT_MAX_RETRIES);
+
         let retry_policy = ExponentialBackoff::builder()
-            .retry_bounds(Duration::from_millis(500), Duration::from_millis(10000))
-            .build_with_max_retries(3);
+            .retry_bounds(Duration::from_millis(1000), Duration::from_millis(30000))
+            .build_with_max_retries(max_retries);
         let client = ClientBuilder::new(client)
-            .with(RetryTransientMiddleware::new_with_policy(retry_policy))
+            .with(RetryTransientMiddleware::new_with_policy_and_strategy(
+                retry_policy,
+                CustomRetryableStrategy,
+            ))
             .build();
 
         Ok(Self {
@@ -120,7 +139,7 @@ impl Video {
 
         let response = get_html(client, url_parsed.as_str(), None).await?;
 
-        let (player_response, initial_response): (PlayerResponse, serde_json::Value) = {
+        let (mut player_response, initial_response): (PlayerResponse, serde_json::Value) = {
             let document = Html::parse_document(&response);
             let scripts_selector = Selector::parse("script").unwrap();
             let player_response_string = document
@@ -128,17 +147,13 @@ impl Video {
                 .filter(|x| x.inner_html().contains("var ytInitialPlayerResponse ="))
                 .map(|x| x.inner_html().replace("var ytInitialPlayerResponse =", ""))
                 .next()
-                .unwrap_or(String::from(""))
-                .trim()
-                .to_string();
+                .unwrap_or(String::from(""));
             let mut initial_response_string = document
                 .select(&scripts_selector)
                 .filter(|x| x.inner_html().contains("var ytInitialData ="))
                 .map(|x| x.inner_html().replace("var ytInitialData =", ""))
                 .next()
-                .unwrap_or(String::from(""))
-                .trim()
-                .to_string();
+                .unwrap_or(String::from(""));
 
             // remove json object last element (;)
             initial_response_string.pop();
@@ -146,14 +161,15 @@ impl Video {
             let player_response = serde_json::from_str::<PlayerResponse>(
                 format!(
                     "{{{}}}}}}}",
-                    between(player_response_string.as_str(), "{", "}}};")
+                    between(player_response_string.trim(), "{", "}}};")
                 )
                 .as_str(),
             )
-            .unwrap();
+            .unwrap_or_default();
 
             let initial_response =
-                serde_json::from_str::<serde_json::Value>(&initial_response_string).unwrap();
+                serde_json::from_str::<serde_json::Value>(initial_response_string.trim())
+                    .unwrap_or_default();
 
             (player_response, initial_response)
         };
@@ -162,21 +178,59 @@ impl Video {
             return Err(VideoError::VideoNotFound);
         }
 
-        if is_private_video(&player_response) {
+        if let Some(reason) = is_player_response_error(&player_response, &["not a bot"]) {
+            return Err(VideoError::VideoPlayerResponseError(reason));
+        }
+
+        let is_age_restricted = is_age_restricted_from_html(&player_response, &response);
+
+        if is_private_video(&player_response) && !is_age_restricted {
             return Err(VideoError::VideoIsPrivate);
         }
 
-        if player_response.streaming_data.is_none()
-            || is_rental(&player_response)
-            || is_not_yet_broadcasted(&player_response)
-        {
+        // POToken experiment detected fallback to ios client (Webpage contains broken formats)
+        if !is_live(&player_response) {
+            let ios_ytconfig = self
+                .get_player_ytconfig(
+                    &response,
+                    INNERTUBE_CLIENT.get("ios").cloned().unwrap_or_default(),
+                    self.options.request_options.po_token.as_ref()
+                )
+                .await?;
+
+            let player_response_new =
+                serde_json::from_str::<PlayerResponse>(&ios_ytconfig).unwrap_or_default();
+
+            player_response.streaming_data = player_response_new.streaming_data;
+        }
+
+        if is_age_restricted {
+            let embed_ytconfig = self
+                .get_player_ytconfig(
+                    &response,
+                    INNERTUBE_CLIENT
+                        .get("tv_embedded")
+                        .cloned()
+                        .unwrap_or_default(),
+                    self.options.request_options.po_token.as_ref()
+                )
+                .await?;
+
+            let player_response_new =
+                serde_json::from_str::<PlayerResponse>(&embed_ytconfig).unwrap_or_default();
+
+            player_response.streaming_data = player_response_new.streaming_data;
+            player_response.storyboards = player_response_new.storyboards;
+        }
+
+        if is_rental(&player_response) || is_not_yet_broadcasted(&player_response) {
             return Err(VideoError::VideoSourceNotFound);
         }
 
         let video_details = clean_video_details(
             &initial_response,
             &player_response,
-            get_media(&initial_response).unwrap(),
+            get_media(&initial_response).unwrap_or_default(),
             self.video_id.clone(),
         );
 
@@ -196,7 +250,11 @@ impl Video {
             formats: {
                 parse_video_formats(
                     &player_response,
-                    get_functions(get_html5player(response.as_str()).unwrap(), client).await?,
+                    get_functions(
+                        get_html5player(response.as_str()).unwrap_or_default(),
+                        client,
+                    )
+                    .await?,
                 )
                 .unwrap_or_default()
             },
@@ -457,8 +515,87 @@ impl Video {
 
     // Necessary to blocking api
     #[allow(dead_code)]
-    pub(crate) fn get_options(&self) -> VideoOptions {
-        self.options.clone()
+    pub(crate) fn get_options(&self) -> &VideoOptions {
+        &self.options
+    }
+
+    #[cfg_attr(feature = "performance_analysis", flamer::flame)]
+    async fn get_player_ytconfig(
+        &self,
+        html: &str,
+        configs: (&str, &str, &str),
+        po_token: Option<&String>,
+    ) -> Result<String, VideoError> {
+        use std::str::FromStr;
+
+        let ytcfg = get_ytconfig(html)?;
+
+        let client = configs.2;
+        let sts = ytcfg.sts.unwrap_or(0);
+        let video_id = self.get_video_id();
+
+        let mut query = serde_json::from_str::<serde_json::Value>(&format!(
+            r#"{{
+            {client}
+            "playbackContext": {{
+                "contentPlaybackContext": {{
+                    "signatureTimestamp": {sts},
+                    "html5Preference": "HTML5_PREF_WANTS"
+                }}
+            }},
+            "videoId": "{video_id}"
+        }}"#
+        ))
+        .unwrap_or_default();
+        if let Some(po_token) = po_token {
+            query
+                .as_object_mut()
+                .expect("Declared as object above")
+                .insert(
+                    "serviceIntegrityDimensions".to_string(),
+                    json!({"poToken": po_token})
+                );
+        }
+
+        static CONFIGS: Lazy<(HeaderMap, &str)> = Lazy::new(|| {
+            (HeaderMap::from_iter([
+            (HeaderName::from_str("content-type").unwrap(), HeaderValue::from_str("application/json").unwrap()),
+            (HeaderName::from_str("Origin").unwrap(), HeaderValue::from_str("https://www.youtube.com").unwrap()),
+            (HeaderName::from_str("User-Agent").unwrap(), HeaderValue::from_str("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/70.0.3513.0 Safari/537.36").unwrap()),
+            (HeaderName::from_str("Referer").unwrap(), HeaderValue::from_str("https://www.youtube.com/").unwrap()),
+            (HeaderName::from_str("Accept").unwrap(), HeaderValue::from_str("text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8").unwrap()),
+            (HeaderName::from_str("Accept-Language").unwrap(), HeaderValue::from_str("en-US,en;q=0.5").unwrap()),
+            (HeaderName::from_str("Accept-Encoding").unwrap(), HeaderValue::from_str("gzip, deflate").unwrap()),
+        ]),"AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8")
+        });
+
+        let mut headers = CONFIGS.0.clone();
+        headers.insert(
+            HeaderName::from_str("X-Youtube-Client-Version").unwrap(),
+            HeaderValue::from_str(configs.0).unwrap(),
+        );
+        headers.insert(
+            HeaderName::from_str("X-Youtube-Client-Name").unwrap(),
+            HeaderValue::from_str(configs.1).unwrap(),
+        );
+
+        let response = self
+            .client
+            .post("https://www.youtube.com/youtubei/v1/player")
+            .headers(headers)
+            .query(&[("key", CONFIGS.1)])
+            .json(&query)
+            .send()
+            .await
+            .map_err(VideoError::ReqwestMiddleware)?;
+
+        let response = response
+            .error_for_status()
+            .map_err(VideoError::Reqwest)?
+            .text()
+            .await?;
+
+        Ok(response)
     }
 }
 
@@ -466,15 +603,12 @@ async fn get_m3u8(
     url: &str,
     client: &reqwest_middleware::ClientWithMiddleware,
 ) -> Result<Vec<(String, String)>, VideoError> {
-    let base_url = Url::parse(BASE_URL).expect("BASE_URL corrapt");
-    let base_url_host = base_url.host_str().expect("BASE_URL host corrapt");
+    let base_url = Url::parse(BASE_URL)?;
+    let base_url_host = base_url.host_str();
 
     let url = Url::parse(url)
         .and_then(|mut x| {
-            let set_host_result = x.set_host(Some(base_url_host));
-            if set_host_result.is_err() {
-                return Err(set_host_result.expect_err("How can be posible"));
-            }
+            x.set_host(base_url_host)?;
             Ok(x)
         })
         .map(|x| x.as_str().to_string())
@@ -482,26 +616,20 @@ async fn get_m3u8(
 
     let body = get_html(client, &url, None).await?;
 
-    let http_regex = regex::Regex::new(r"^https?://").unwrap();
-    let itag_regex = regex::Regex::new(r"/itag/(\d+)/").unwrap();
+    static HTTP_REGEX: Lazy<regex::Regex> = Lazy::new(|| regex::Regex::new(r"^https?://").unwrap());
+    static ITAG_REGEX: Lazy<regex::Regex> =
+        Lazy::new(|| regex::Regex::new(r"/itag/(\d+)/").unwrap());
 
     let itag_and_url = body
         .split('\n')
-        .filter(|x| http_regex.is_match(x) && itag_regex.is_match(x));
+        .filter(|x| HTTP_REGEX.is_match(x) && ITAG_REGEX.is_match(x));
 
-    let itag_and_url: Vec<(String, String)> = itag_and_url
-        .map(|line| {
-            let itag = itag_regex
-                .captures(line)
-                .expect("IMPOSSIBLE")
-                .get(1)
-                .map(|x| x.as_str())
-                .unwrap_or("");
-
-            // println!("itag: {}, url: {}", itag, line);
-            (itag.to_string(), line.to_string())
+    Ok(itag_and_url
+        .filter_map(|line| {
+            ITAG_REGEX.captures(line).and_then(|caps| {
+                caps.get(1)
+                    .map(|itag| (itag.as_str().to_string(), line.to_string()))
+            })
         })
-        .collect();
-
-    Ok(itag_and_url)
+        .collect::<Vec<(String, String)>>())
 }
